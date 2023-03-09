@@ -1,5 +1,5 @@
 use docopt::Docopt;
-use std::{path::{PathBuf, Path}, time::Duration, num::NonZeroU32};
+use std::{path::{PathBuf, Path}, time::Duration, num::NonZeroU32, sync::Arc};
 use notify::{self, Watcher, RecommendedWatcher};
 use log::{info, debug, warn, error};
 use thiserror::Error;
@@ -25,6 +25,8 @@ Required:
     <config_file>       INI file with configuration
 
 Options:
+ -1 --once              Post all files in folder and exit
+                        (with status 0 for success, 1 for failure)
  -d --debug             Enable debug logging
  -h --help              Show this screen
  -v --version           Show version ("{NAME} {VERSION}")
@@ -272,11 +274,18 @@ fn post_message(conf: &BotConfig, msg: &BotSlackMessage) -> BotResult<()> {
 
 /**
  * Worker thread for a single folder/channel pair.
+ * 
+ * @param conf Bot configuration (for a this channel)
+ * @param once If true, post all files in the folder and exit
  */
-fn bot_thread(conf: BotConfig) -> BotResult<()>
+fn bot_thread(conf: BotConfig, once: bool) -> BotResult<()>
 {
     info!("Starting bot thread: {:?}. Folder {:?}, channel: {:?}",
         conf.bot_name, conf.folder, conf.slack_channel);
+
+    if !conf.folder.exists() {
+        return Err(BotError::AnyhowError(anyhow!("Folder does not exist: {:?}", conf.folder)));
+    }
 
     let upload_limiter = RateLimiter::direct(Quota::per_minute(conf.limit_uploads_per_minute));
     let limit_warning_limiter = RateLimiter::direct(Quota::per_minute(NonZeroU32::new(1).unwrap()));
@@ -288,20 +297,37 @@ fn bot_thread(conf: BotConfig) -> BotResult<()>
     std::fs::create_dir_all(&rejected_dir)?;
     std::fs::create_dir_all(&posted_dir)?;
 
-    // Start file watcher thread
+    // Start file watcher thread or scan folder once
     let (files_tx, files_rx) = std::sync::mpsc::channel();
-    let c = conf.clone();
-    let watcher_thread = std::thread::spawn(move || {
-        let conf = c;
-        file_watcher(conf.folder.clone(), files_tx).unwrap();
-    });
+    let watcher_thread = if once {
+        info!("Scanning folder (--once)");
+        for path in std::fs::read_dir(&conf.folder)?
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().ok().map(|t| t.is_file()).unwrap_or(false))
+            .map(|e| e.path()) {
+                files_tx.send(path).map_err(|e| BotError::AnyhowError(anyhow!("Failed to send file to watcher thread: {}", e)))?;
+            }
+        None
+    } else {
+        let c = conf.clone();
+        Some(std::thread::spawn(move || {
+            let conf = c;
+            file_watcher(conf.folder.clone(), files_tx).unwrap();
+        }))
+    };
 
-    fn handle_file(path: &Path, conf: &BotConfig) -> BotResult<()> 
+    fn handle_file(path: &Path, conf: &BotConfig, no_settle: bool) -> BotResult<()> 
     {
-        let file_basename = path.file_name().ok_or(anyhow!("Invalid file path"))?.to_string_lossy();
-        wait_until_file_settles(&path, FILE_SETTLE_WAIT, FILE_SETTLE_MAX_WAIT)?;
+        let basename = path.file_name().ok_or(anyhow!("Invalid file path"))?.to_string_lossy();
+        if basename.starts_with(".") {  // Skip dotfiles
+            return Ok(());
+        }
+
+        if !no_settle {
+            wait_until_file_settles(&path, FILE_SETTLE_WAIT, FILE_SETTLE_MAX_WAIT)?;
+        }
         post_message(conf, &BotSlackMessage {
-            title: Some(file_basename.to_string()),
+            title: Some(basename.to_string()),
             text: None,
             icon_emoji: None,
             file: Some(path.to_path_buf())
@@ -321,6 +347,7 @@ fn bot_thread(conf: BotConfig) -> BotResult<()>
     }
 
     let mut queue = std::collections::VecDeque::new();
+    let mut had_errors = false;
     loop {
         // Check for new files, add to queue
         match files_rx.recv_timeout(Duration::from_millis(100)) {
@@ -352,12 +379,13 @@ fn bot_thread(conf: BotConfig) -> BotResult<()>
             // Post next file
             if let Some(path) = queue.pop_front() {
                 let file_basename = path.file_name().ok_or(anyhow!("Invalid file path"))?;
-                match handle_file(&path, &conf) {
+                match handle_file(&path, &conf, once) {
                     Ok(_) => {
                         let posted_path = posted_dir.join(file_basename);
                         std::fs::rename(&path, posted_path)?;
                     },
                     Err(e) => {
+                        had_errors = true;
                         error!("Error handling file: {:?}", e);
                         let rejected_path = rejected_dir.join(file_basename);
                         std::fs::rename(&path, rejected_path)?;
@@ -369,10 +397,18 @@ fn bot_thread(conf: BotConfig) -> BotResult<()>
                     }
                 }        
             }
+        } else if once {
+            info!("Done scanning folder (--once)");
+            break;
         }
     }
 
-    watcher_thread.join().unwrap();
+    if let Some(t) = watcher_thread {
+        t.join().unwrap();
+    }
+    if once && had_errors {
+        return Err(BotError::AnyhowError(anyhow!("There were errors processing files")));
+    }
     Ok(())
 }
 
@@ -394,6 +430,8 @@ fn main() -> anyhow::Result<()>
         return Ok(());
     }
 
+    let once = args.get_bool("--once");
+
     if args.get_bool("--debug") {
         env_logger::builder()
             .filter_level(log::LevelFilter::Debug)
@@ -407,10 +445,17 @@ fn main() -> anyhow::Result<()>
     let config_file = PathBuf::from(args.get_str("<config_file>"));
     let bots = read_config_file(&config_file)?;
 
+    //let mut had_errors = false;
+    let had_errors = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
     let mut threads = Vec::new();
     for bot in bots {
+        let had_errors = had_errors.clone();
         let t = std::thread::spawn(move || {
-            bot_thread(bot).unwrap();
+            if let Err(e) = bot_thread(bot, once) {
+                had_errors.store(true, std::sync::atomic::Ordering::Relaxed);
+                error!("Error running bot: {:?}", e);
+            }
         });
         threads.push(t);
     }
@@ -418,6 +463,10 @@ fn main() -> anyhow::Result<()>
     for t in threads {
         t.join().unwrap();
     }
-    
+
+    if had_errors.load(std::sync::atomic::Ordering::Relaxed) {
+        warn!("There were errors running bots. Exiting with error code.");
+        std::process::exit(1);
+    }
     Ok(())
 }
