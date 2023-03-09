@@ -5,8 +5,31 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[package.metadata.deb]
+
+maintainer = "Jarno Elonen <elonen@iki.fi>"
+copyright = "2023, Jarno Elonen <elonen@iki.fi>"
+section = "unknown"
+changelog = "debian/changelog"
+
+depends = "$auto"
+
+extended-description = """\
+Daemon that monitors folders for new files and posts them to Slack channels.
+"""
+
+maintainer-scripts = "debian"
+assets = [
+    ["target/release/slack-app-folder-echo", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/slack-app-folder-echo/README", "644"],
+    ["example.ini", "etc/slack-app-folder-echo.conf", "640"],
+]
+conf-files = ["/etc/slack-app-folder-echo.conf"]
+systemd-units = { enable = false }
+
 [dependencies]
 anyhow = "1.0.69"
+cargo-deb = "1.42.2"
 docopt = "1.1.1"
 env_logger = "0.10.0"
 governor = "0.5.1"

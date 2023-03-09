@@ -13,15 +13,13 @@ const NAME: &'static str = env!("CARGO_PKG_NAME");
 const VERSION: &'static str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &'static str = r#"
-Slack folder-echo bot
-
 Monitors given folder for new files and posts them to Slack.
 If post fails, the file is moved to a "rejected" folder.
 On success, the file is moved to a "posted" folder.
 
 Usage:
-  slack-folder-echo [options] <config_file>
-  slack-folder-echo (-h | --help)
+  {NAME} [options] <config_file>
+  {NAME} (-h | --help)
 
 Required:
     <config_file>       INI file with configuration
@@ -29,7 +27,7 @@ Required:
 Options:
  -d --debug             Enable debug logging
  -h --help              Show this screen
- -v --version           Show version
+ -v --version           Show version ("{NAME} {VERSION}")
 
 
 Example configuration file:
@@ -205,9 +203,9 @@ fn post_message(conf: &BotConfig, msg: &BotSlackMessage) -> BotResult<()> {
         form = form.text("username", conf.bot_name.clone());
         form = form.text("channels", conf.slack_channel.clone());
         
-        if std::fs::metadata(file)?.len() > 1024*1024 {
-            return Err(BotError::AnyhowError(anyhow!("File too large for Slack")));
-        }
+        //if std::fs::metadata(file)?.len() > 1024*1024 {
+        //    return Err(BotError::AnyhowError(anyhow!("File too large for Slack")));
+        //}
         let part = reqwest::blocking::multipart::Part::file(file)?;
         form = form.part("file", part);
 
@@ -385,9 +383,11 @@ fn bot_thread(conf: BotConfig) -> BotResult<()>
 fn main() -> anyhow::Result<()>
 {
     let argv = std::env::args;
-    let args = Docopt::new(USAGE)
-        .and_then(|d| d.argv(argv().into_iter()).parse())
-        .unwrap_or_else(|e| e.exit());
+    let args = Docopt::new(USAGE
+            .replace("{NAME}", NAME)
+            .replace("{VERSION}", VERSION)
+        ).and_then(|d| d.argv(argv().into_iter()).parse())
+         .unwrap_or_else(|e| e.exit());
 
     if args.get_bool("--version") {
         println!("{} {}", NAME, VERSION);

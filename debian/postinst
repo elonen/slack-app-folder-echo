@@ -1,0 +1,16 @@
+#!/bin/sh
+
+# Cargo.toml apparently doesn't allow setting owner/group for files, so we do it here
+
+chown root:www-data /etc/slack-app-folder-echo.conf
+chmod 640 /etc/slack-app-folder-echo.conf
+
+if [ ! -f /var/log/slack-app-folder-echo.log ]; then
+    touch /var/log/slack-app-folder-echo.log
+fi
+chown root:www-data /var/log/slack-app-folder-echo.log
+chmod 660 /var/log/slack-app-folder-echo.log
+
+#DEBHELPER#
+
+exit 0

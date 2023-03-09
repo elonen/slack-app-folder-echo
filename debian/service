@@ -1,0 +1,16 @@
+[Unit]
+Description=Folder Echo Slack app
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Restart=no
+RestartSec=2
+User=www-data
+ExecStart=/usr/bin/slack-app-folder-echo /etc/slack-app-folder-echo.conf
+StandardOutput=append:/var/log/slack-app-folder-echo.log
+StandardError=inherit
+
+[Install]
+WantedBy=multi-user.target
