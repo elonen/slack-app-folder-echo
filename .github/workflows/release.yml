@@ -1,0 +1,57 @@
+name: release
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  build_release:
+    name: build_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'write'
+      id-token: 'write'
+    steps:
+      #
+      # Build and cache Docker image
+      #
+      - uses: actions/checkout@v3
+      - uses: docker/setup-buildx-action@v2
+      - uses: docker/build-push-action@v4
+        with:
+          context: .
+          tags: slack-app-folder-echo-build
+          load: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      #
+      # Build the code - this takes a while
+      #
+      - name: build artifacts
+        run: ./build-packages-in-docker.sh --skip-docker-build
+      #
+      # Figure out what we built
+      #
+      - name: Extract variables from the build
+        run: |
+          echo "debfile=$(ls *.deb | head -n1)" >> $GITHUB_OUTPUT
+          echo "exefile=$(ls *.exe | head -n1)" >> $GITHUB_OUTPUT
+        id: getvars
+      - name: Sanity check
+        run: |
+          test -f "${{ steps.getvars.outputs.debfile }}"
+          test -f "${{ steps.getvars.outputs.exefile }}"
+      #
+      # Make a release and upload artifacts
+      #
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: |
+            ${{ steps.getvars.outputs.debfile }}
+            ${{ steps.getvars.outputs.exefile }}
+          body_path: CHANGELOG.md
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

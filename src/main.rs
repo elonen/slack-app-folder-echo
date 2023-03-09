@@ -20,6 +20,7 @@ On success, the file is moved to a "posted" folder.
 Usage:
   {NAME} [options] <config_file>
   {NAME} (-h | --help)
+  {NAME} (-v | --version)
 
 Required:
     <config_file>       INI file with configuration
@@ -29,7 +30,7 @@ Options:
                         (with status 0 for success, 1 for failure)
  -d --debug             Enable debug logging
  -h --help              Show this screen
- -v --version           Show version ("{NAME} {VERSION}")
+ -v --version           Show version ("{VERSION}")
 
 
 Example configuration file:
@@ -426,7 +427,7 @@ fn main() -> anyhow::Result<()>
          .unwrap_or_else(|e| e.exit());
 
     if args.get_bool("--version") {
-        println!("{} {}", NAME, VERSION);
+        println!("{}", VERSION);
         return Ok(());
     }
 
