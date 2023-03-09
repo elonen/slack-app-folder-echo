@@ -1,9 +1,10 @@
 use docopt::Docopt;
-use std::{path::{PathBuf, Path}, time::Duration};
+use std::{path::{PathBuf, Path}, time::Duration, num::NonZeroU32};
 use notify::{self, Watcher, RecommendedWatcher};
-use anyhow;
 use log::{info, debug, warn, error};
 use thiserror::Error;
+use governor::{Quota, RateLimiter};
+use anyhow::anyhow;
 
 const FILE_SETTLE_MAX_WAIT: Duration = Duration::from_secs(60);
 const FILE_SETTLE_WAIT: Duration = Duration::from_secs(5);
@@ -34,14 +35,17 @@ Options:
 
 Example configuration file:
 
-    [folder1]
-    bot_name = My Folderbot
+    [public folder]
+    bot_name = Cat Pictures!
     bot_icon = :robot_face:
     folder = /path/to/my_folder
-    slack_channel = #my_channel
+    limit_uploads_per_minute = 10
+    slack_channel = #daily-cat-pictures
     slack_token = xoxb-1234567890-1234567890-1234567890-1234567890
 
-    [folder2]
+    [my private folder]
+    folder = /home/user/private_folder
+    slack_channel = @user_name
     ...
 "#;
 
@@ -76,6 +80,7 @@ type BotResult<T> = Result<T, BotError>;
 struct BotConfig {
     bot_name: String,
     folder: PathBuf,
+    limit_uploads_per_minute: NonZeroU32,
     slack_channel: String,
     slack_token: String,
 }
@@ -88,25 +93,35 @@ struct BotSlackMessage {
     file: Option<PathBuf>,
 }
 
-
+/**
+ * Parse an INI config file.
+ */
 fn read_config_file(config_file: &Path) -> BotResult<Vec<BotConfig>>
 {
     info!("Reading config file: {:?}", config_file);
     let config = ini::Ini::load_from_file(config_file)?;
     let mut bots = Vec::new();
     for (_, section) in config.iter() {
-        let bot_name =  section.get("bot_name").ok_or(anyhow::anyhow!("Missing bot_name"))?.to_string();
-        let folder = PathBuf::from(section.get("folder").ok_or(anyhow::anyhow!("Missing folder"))?);
-        let slack_channel = section.get("slack_channel").ok_or(anyhow::anyhow!("Missing slack_channel"))?.to_string();
-        let slack_token = section.get("slack_token").ok_or(anyhow::anyhow!("Missing slack_token"))?.to_string();
+        let bot_name =  section.get("bot_name").ok_or(anyhow!("Missing bot_name"))?.to_string();
+        let folder = PathBuf::from(section.get("folder").ok_or(anyhow!("Missing folder"))?);
+        let limit_uploads_per_minute = section.get("limit_uploads_per_minute")
+            .ok_or(anyhow::anyhow!("Missing limit_uploads_per_minute"))?.parse::<NonZeroU32>()
+            .map_err(|_| anyhow::anyhow!("Invalid limit_uploads_per_minute"))?;
+        let slack_channel = section.get("slack_channel").ok_or(anyhow!("Missing slack_channel"))?.to_string();
+        let slack_token = section.get("slack_token").ok_or(anyhow!("Missing slack_token"))?.to_string();
         info!("Found bot: {:?}, watching folder: {:?}", bot_name, folder);
-        bots.push(BotConfig { bot_name, folder, slack_channel, slack_token });
+        bots.push(BotConfig { bot_name, folder, limit_uploads_per_minute, slack_channel, slack_token });
     }
     Ok(bots)
 }
 
-/// Watch a folder for new files and send them to the given channel.
-/// This function will block until given path is unwatch()ed.
+/**
+ * Watch a folder for new files and send them to the given channel.
+ * This function will block until given path is unwatch()ed (i.e. paths_tx closes).
+ * 
+ * @param config Bot configuration
+ * @param paths_rx Channel to receive new file paths
+ */
 fn file_watcher(folder: PathBuf, paths_tx: std::sync::mpsc::Sender<PathBuf>) -> notify::Result<()> {
     let (tx, rx) = std::sync::mpsc::channel();
 
@@ -138,11 +153,17 @@ fn file_watcher(folder: PathBuf, paths_tx: std::sync::mpsc::Sender<PathBuf>) -> 
 }
 
 
-/// Waits until a file settles -- that is, hasn't grown in size for a `settle_wait` time.
-/// Returns an error if the file doesn't settle within `max_wait` time.
+/**
+ * Waits until a file settles -- that is, hasn't grown in size for a `settle_wait` time.
+ * 
+ * @param path Path to file
+ * @param settle_wait Time to wait for file to stop growing
+ * @param max_wait Maximum time to wait for file to settle before giving up
+ * @return Ok(()) if file settles, Err(TimeoutError) if file doesn't settle within `max_wait` time
+ */
 fn wait_until_file_settles(path: &Path, settle_wait: Duration, max_wait: Duration ) -> BotResult<()> {
     assert!(settle_wait < max_wait);
-    let file_basename = path.file_name().ok_or(anyhow::anyhow!("Invalid file path"))?.to_string_lossy();
+    let file_basename = path.file_name().ok_or(anyhow!("Invalid file path"))?.to_string_lossy();
     info!("Waiting for file to settle: {:?} (max_wait: {:?}, settle_wait: {:?})", file_basename, max_wait, settle_wait);
 
     let start_t = std::time::Instant::now();
@@ -164,7 +185,12 @@ fn wait_until_file_settles(path: &Path, settle_wait: Duration, max_wait: Duratio
     Err(BotError::TimeoutError(max_wait))
 }
 
-// User http client to upload file + optional message to slack channel
+/**
+ * Upload file or a message to Slack
+ * 
+ * @param conf Bot configuration (for a single channel)
+ * @param msg Message to post
+ */
 fn post_message(conf: &BotConfig, msg: &BotSlackMessage) -> BotResult<()> {
     let res = if let Some(file) = &msg.file
     {
@@ -180,7 +206,7 @@ fn post_message(conf: &BotConfig, msg: &BotSlackMessage) -> BotResult<()> {
         form = form.text("channels", conf.slack_channel.clone());
         
         if std::fs::metadata(file)?.len() > 1024*1024 {
-            return Err(BotError::AnyhowError(anyhow::anyhow!("File too large for Slack")));
+            return Err(BotError::AnyhowError(anyhow!("File too large for Slack")));
         }
         let part = reqwest::blocking::multipart::Part::file(file)?;
         form = form.part("file", part);
@@ -223,10 +249,16 @@ fn post_message(conf: &BotConfig, msg: &BotSlackMessage) -> BotResult<()> {
 }
 
 
+/**
+ * Worker thread for a single folder/channel pair.
+ */
+fn bot_thread(conf: BotConfig) -> BotResult<()>
+{
+    info!("Starting bot thread: {:?}. Folder {:?}, channel: {:?}",
+        conf.bot_name, conf.folder, conf.slack_channel);
 
-fn bot_thread(conf: BotConfig) -> BotResult<()> {
-
-    info!("Starting bot thread: {:?}. Folder {:?}", conf.bot_name, conf.folder);
+    let upload_limiter = RateLimiter::direct(Quota::per_minute(conf.limit_uploads_per_minute));
+    let limit_warning_limiter = RateLimiter::direct(Quota::per_minute(NonZeroU32::new(1).unwrap()));
 
     // Create folders for rejected and posted files
     let rejected_dir = conf.folder.join("rejected");
@@ -245,7 +277,7 @@ fn bot_thread(conf: BotConfig) -> BotResult<()> {
 
     fn handle_file(path: &Path, conf: &BotConfig) -> BotResult<()> 
     {
-        let file_basename = path.file_name().ok_or(anyhow::anyhow!("Invalid file path"))?.to_string_lossy();
+        let file_basename = path.file_name().ok_or(anyhow!("Invalid file path"))?.to_string_lossy();
         wait_until_file_settles(&path, FILE_SETTLE_WAIT, FILE_SETTLE_MAX_WAIT)?;
         post_message(conf, &BotSlackMessage {
             title: Some(file_basename.to_string()),
@@ -267,23 +299,54 @@ fn bot_thread(conf: BotConfig) -> BotResult<()> {
         Ok(())
     }
 
-    // Wait for new files
-    for path in files_rx {
-        let file_basename = path.file_name().ok_or(anyhow::anyhow!("Invalid file path"))?;
-        match handle_file(&path, &conf) {
-            Ok(_) => {
-                let posted_path = posted_dir.join(file_basename);
-                std::fs::rename(&path, posted_path)?;
-            },
+    let mut queue = std::collections::VecDeque::new();
+    loop {
+        // Check for new files, add to queue
+        match files_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(path) => { queue.push_back(path); },
             Err(e) => {
-                error!("Error handling file: {:?}", e);
-                let rejected_path = rejected_dir.join(file_basename);
-                std::fs::rename(&path, rejected_path)?;
+                match e {
+                    std::sync::mpsc::RecvTimeoutError::Timeout => {},
+                    std::sync::mpsc::RecvTimeoutError::Disconnected => {
+                        error!("File watcher thread disconnected");
+                        break;
+                    }}}};
 
-                let lossy = file_basename.to_string_lossy().to_string();
-                if let Err(e2) = post_error(&lossy, &conf, &e) {
-                    error!("Error posting error message: {:?}", e2);
+        // Process files form queue if rate limit allows
+        if !queue.is_empty()
+        {
+            if upload_limiter.check().is_err() {
+                if limit_warning_limiter.check().is_ok() {
+                    warn!("Upload rate limit exceeded");
+                    post_message(&conf, &BotSlackMessage {
+                        title: Some(format!("(Upload rate limit exceeded.)")),
+                        text: Some(format!("Note: There are currently too many (>{}) files to upload per minute. Limiting posting rate for now.", conf.limit_uploads_per_minute)),
+                        icon_emoji: Some(":snail:".to_string()),
+                        file: None
+                    })?;
                 }
+                continue;
+            }
+
+            // Post next file
+            if let Some(path) = queue.pop_front() {
+                let file_basename = path.file_name().ok_or(anyhow!("Invalid file path"))?;
+                match handle_file(&path, &conf) {
+                    Ok(_) => {
+                        let posted_path = posted_dir.join(file_basename);
+                        std::fs::rename(&path, posted_path)?;
+                    },
+                    Err(e) => {
+                        error!("Error handling file: {:?}", e);
+                        let rejected_path = rejected_dir.join(file_basename);
+                        std::fs::rename(&path, rejected_path)?;
+        
+                        let lossy = file_basename.to_string_lossy().to_string();
+                        if let Err(e2) = post_error(&lossy, &conf, &e) {
+                            error!("Error posting error message: {:?}", e2);
+                        }
+                    }
+                }        
             }
         }
     }
@@ -293,6 +356,9 @@ fn bot_thread(conf: BotConfig) -> BotResult<()> {
 }
 
 
+/**
+ * Main entry point.
+ */
 fn main() -> anyhow::Result<()>
 {
     let argv = std::env::args;
