@@ -14,4 +14,5 @@ log = "0.4.17"
 notify = "5.1.0"
 reqwest = { version="0.11.14", features = ["multipart", "blocking"] }
 rust-ini = "0.18.0"
+serde_json = "1.0.94"
 thiserror = "1.0.39"

@@ -27,7 +27,6 @@ Required:
     <config_file>       INI file with configuration
 
 Options:
- -j --json              Log in JSON format
  -d --debug             Enable debug logging
  -h --help              Show this screen
  -v --version           Show version
@@ -202,7 +201,8 @@ fn post_message(conf: &BotConfig, msg: &BotSlackMessage) -> BotResult<()> {
         }
         if let Some(title) = &msg.title {
             form = form.text("title", title.clone());
-        }    
+        }
+        form = form.text("username", conf.bot_name.clone());
         form = form.text("channels", conf.slack_channel.clone());
         
         if std::fs::metadata(file)?.len() > 1024*1024 {
@@ -224,6 +224,7 @@ fn post_message(conf: &BotConfig, msg: &BotSlackMessage) -> BotResult<()> {
         let client = reqwest::blocking::Client::new();
         let mut params = std::collections::HashMap::new();
         params.insert("channel", conf.slack_channel.clone());
+        params.insert("username", conf.bot_name.clone());
         if let Some(text) = &msg.text {
             let mut text = text.clone();
             if let Some(title) = &msg.title {
@@ -240,11 +241,33 @@ fn post_message(conf: &BotConfig, msg: &BotSlackMessage) -> BotResult<()> {
             .send()
     }?;
 
-    debug!("Slack HTTP API response: {:?}", res);
-
-    if !res.status().is_success() {
-        return Err(BotError::SlackApiError(res.text()?));
-    }
+    // Check HTTP and Slack response status
+    match res.error_for_status() {
+        Ok(res) => {
+            if let Ok(text) = res.text() {
+                let json = serde_json::from_str::<serde_json::Value>(&text)
+                    .map_err(|e| BotError::AnyhowError(anyhow!("Failed to parse Slack response: {}", e)))?;
+                match json["ok"].as_bool() {
+                    Some(true) => {
+                        info!("Got Ok from Slack");
+                    },
+                    Some(false) => {
+                        error!("Slack error response: {}", text);
+                        let err_str = json["error"].as_str().unwrap_or("No error field in response");
+                        return Err(BotError::SlackApiError(err_str.into()));
+                    },
+                    None => {
+                        error!("Slack response: {}", text);
+                        return Err(BotError::SlackApiError("No 'ok' field in response".to_string()));
+                    },
+                }
+            } else {
+                error!("Slack response: <no text>");
+                return Err(BotError::SlackApiError("No text in response".to_string()));
+            }
+        },
+        Err(e) => return Err(BotError::HttpError(e)),
+    };
     Ok(())
 }
 
