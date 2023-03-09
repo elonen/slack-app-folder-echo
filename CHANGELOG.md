@@ -1,0 +1,1 @@
+- Automate packaging with Github actions

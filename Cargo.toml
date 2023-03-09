@@ -3,11 +3,12 @@ name = "slack-app-folder-echo"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+description = "Scan local folder(s) and post new file(s) to Slack"
+license = "MIT"
+readme = "README.md"
 
-[profile.release]
-lto = "fat"
-codegen-units = 1
+[[bin]]
+name = "slack-app-folder-echo"
 
 [package.metadata.deb]
 

@@ -1,0 +1,66 @@
+name: release
+
+on:
+  push:
+    tags:
+      - '*'
+
+jobs:
+  build_release:
+    name: build_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: 'write'
+      id-token: 'write'
+    steps:
+      #
+      # Build and cache Docker image
+      #
+      - uses: actions/checkout@v3
+      - uses: docker/setup-buildx-action@v2
+      - uses: docker/build-push-action@v4
+        with:
+          context: .
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      #
+      # Build the code - this takes a while
+      #
+      - name: build artifacts
+        run: ./build-packages-in-docker.sh
+      #
+      # Make the release
+      #
+      - name: getvars
+        run: |
+          echo "version=$(./slack-app-folder-echo --version)" >> $GITHUB_OUTPUT
+          echo "debfile=$(ls *.deb | head -n1)" >> $GITHUB_OUTPUT
+          echo "exefile=$(ls *.exe | head -n1)" >> $GITHUB_OUTPUT
+        id: getvars
+      - name: release
+        uses: actions/create-release@v1
+        id: create_release
+        with:
+          draft: false
+          prerelease: false
+          release_name: ${{ steps.getvars.outputs.version }}
+          tag_name: ${{ github.ref }}
+          body_path: CHANGELOG.md
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - name: upload Debian artifact
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ steps.getvars.outputs.debfile }}
+          asset_content_type: application/vnd.debian.binary-package
+      - name: upload Windows artifact
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ${{ steps.getvars.outputs.exefile }}
+          asset_content_type:  application/x-dosexec
